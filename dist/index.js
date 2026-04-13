@@ -9,8 +9,9 @@ const execFileAsync = promisify(execFile);
 class ActionError extends Error {}
 
 const getInput = (name, required = false, defaultValue = "") => {
-  const envName = `INPUT_${name.replace(/ /g, "_").replace(/-/g, "_").toUpperCase()}`;
-  const value = (process.env[envName] ?? defaultValue).trim();
+  const canonical = `INPUT_${name.replace(/ /g, "_").toUpperCase()}`;
+  const legacyUnderscore = `INPUT_${name.replace(/ /g, "_").replace(/-/g, "_").toUpperCase()}`;
+  const value = (process.env[canonical] ?? process.env[legacyUnderscore] ?? defaultValue).trim();
   if (required && value.length === 0) {
     throw new ActionError(`Missing required input: ${name}`);
   }
