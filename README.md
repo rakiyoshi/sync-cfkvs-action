@@ -2,6 +2,11 @@
 
 GitHub Action to synchronize an Amazon CloudFront KeyValueStore from a repository JSONC file.
 
+## Runtime requirements
+
+- GitHub hosted runner (or self-hosted runner) with AWS CLI v2 available in PATH
+- Credentials configured (for example via `aws-actions/configure-aws-credentials`)
+
 ## Inputs
 
 - `kvs-arn` (required)
