@@ -21,6 +21,5 @@ export type ActionInputs = {
   failOnEmpty: boolean;
   maxPreviewItems: number;
   logLevel: LogLevel;
-  awsRegion: string;
   prefix: string;
 };

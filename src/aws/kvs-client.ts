@@ -18,7 +18,7 @@ export class KvsService implements IKvsService {
   private readonly maxRetries: number;
 
   constructor(region: string, maxRetries = 3) {
-    this.client = new CloudFrontKeyValueStoreClient({ region });
+    this.client = new CloudFrontKeyValueStoreClient({ region: 'us-east-1' });
     this.maxRetries = maxRetries;
   }
 

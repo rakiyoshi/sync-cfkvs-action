@@ -35,7 +35,6 @@ export const readInputs = (): ActionInputs => {
     failOnEmpty: getBooleanInput("fail-on-empty", true),
     maxPreviewItems: getIntegerInput("max-preview-items", 50),
     logLevel,
-    awsRegion: (core.getInput("aws-region") || "us-east-1").trim(),
     prefix: (core.getInput("prefix") || "").trim(),
   };
 };
