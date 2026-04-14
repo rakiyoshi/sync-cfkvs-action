@@ -22,7 +22,7 @@ const run = async (): Promise<void> => {
       throw new ConfigurationError("Parsed desired dataset is empty while fail-on-empty=true.");
     }
 
-    const kvsService = new KvsService(inputs.awsRegion);
+    const kvsService = new KvsService();
     const current = await kvsService.listAllKeys(inputs.kvsArn);
 
     const diff = computeDiff(desired, current, {
