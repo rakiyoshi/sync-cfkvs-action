@@ -9,35 +9,48 @@ GitHub Action to synchronize an Amazon CloudFront KeyValueStore from a repositor
 
 ## Inputs
 
-- `kvs-arn` (required)
-- `file` (required)
-- `dry-run` (`false` by default)
-- `delete-missing` (`true` by default)
-- `fail-on-empty` (`true` by default)
-- `max-preview-items` (`50` by default)
-- `log-level` (`info` by default; `info` or `debug`)
-- `aws-region` (`us-east-1` by default)
-- `prefix` (empty by default)
+See [action.yml](action.yml).
 
-## Build
+```yaml
+- uses: rakiyoshi/sync-cloudfront-kvs-action@v1
+  with:
+    # ARN of the target Amazon CloudFront KeyValueStore
+    kvs-arn: ""
 
-```bash
-npm install
-npm run build
-```
+    # Path to the JSONC source file
+    file: ""
 
-## Test
+    # If true, do not apply changes to the target CloudFront KeyValueStore
+    # Default: false
+    dry-run: "false"
 
-```bash
-npm test
+    # If true, delete keys from the target CloudFront KeyValueStore that are not present in the source file
+    # Default: true
+    delete-missing: "true"
+
+    # If true, fail the job if the source file is empty
+    # Default: true
+    fail-on-empty: "true"
+
+    # Maximum number of items to preview in the logs
+    # Default: 50
+    max-preview-items: "50"
+
+    # Level of logging to use (info or debug)
+    # Default: info
+    log-level: "info"
+
+    # Optional prefix to filter the keys to manage
+    # Default: ''
+    prefix: ""
 ```
 
 ## Example workflow
 
 ```yaml
-- uses: your-org/sync-cloudfront-kvs-action@v1
+- uses: rakiyoshi/sync-cloudfront-kvs-action@v1
   with:
-    kvs-arn: ${{ secrets.CLOUDFRONT_KVS_ARN }}
+    kvs-arn: ${{ env.CLOUDFRONT_KVS_ARN }}
     file: cloudfront/kvs/allowlist.jsonc
     dry-run: "false"
     delete-missing: "true"
