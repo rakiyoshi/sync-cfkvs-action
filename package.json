@@ -1,0 +1,25 @@
+{
+  "name": "sync-cfkvs-action",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitHub Action to sync CloudFront KeyValueStore from JSONC",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@aws-sdk/client-cloudfront-keyvaluestore": "^3.917.0",
+    "jsonc-parser": "^3.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

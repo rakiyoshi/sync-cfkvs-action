@@ -1,0 +1,41 @@
+name: Sync CloudFront KVS from JSONC
+description: Synchronize Amazon CloudFront KeyValueStore contents from a repository JSONC file
+inputs:
+  kvs-arn:
+    required: true
+    description: ARN of the target Amazon CloudFront KeyValueStore
+  file:
+    required: true
+    description: Path to the JSONC source file
+  dry-run:
+    required: false
+    default: "false"
+    description: If true, do not apply changes to the target CloudFront KeyValueStore
+  delete-missing:
+    required: false
+    default: "true"
+    description: If true, delete keys from the target CloudFront KeyValueStore that are not present in the source file
+  fail-on-empty:
+    required: false
+    default: "true"
+    description: If true, fail the job if the source file is empty
+  max-preview-items:
+    required: false
+    default: "50"
+    description: Maximum number of items to preview in the logs
+  log-level:
+    required: false
+    default: "info"
+    description: Level of logging to use
+  aws-region:
+    required: false
+    default: "us-east-1"
+    description: Region of the target Amazon CloudFront KeyValueStore
+  prefix:
+    required: false
+    default: ""
+    description: Optional prefix to filter the keys to manage
+
+runs:
+  using: node24
+  main: dist/index.js
