@@ -1,89 +1,370 @@
-import * as core from "@actions/core";
-import { readInputs } from "./inputs.js";
-import { loadDesiredStateFromFile } from "./parser.js";
-import { computeDiff, filterByPrefix } from "./diff.js";
-import { createLogger, maskValue } from "./log.js";
-import { KvsService } from "./aws/kvs-client.js";
-import { ConfigurationError, ParseValidationError } from "./errors.js";
+import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+const MAX_UPDATE_ITEMS_PER_REQUEST = 50;
+
+class ActionError extends Error {}
+
+type PutItem = { key: string; value: string };
+type DeleteItem = { key: string };
+
+type DiffResult = {
+  puts: PutItem[];
+  deletes: DeleteItem[];
+  desiredCount: number;
+  currentCount: number;
+};
+
+const getInput = (name: string, required = false, defaultValue = ""): string => {
+  const canonical = `INPUT_${name.replace(/ /g, "_").toUpperCase()}`;
+  const legacyUnderscore = `INPUT_${name.replace(/ /g, "_").replace(/-/g, "_").toUpperCase()}`;
+  const value = (process.env[canonical] ?? process.env[legacyUnderscore] ?? defaultValue).trim();
+
+  if (required && value.length === 0) {
+    throw new ActionError(`Missing required input: ${name}`);
+  }
+
+  return value;
+};
+
+const setFailed = (message: string): void => {
+  process.stderr.write(`::error::${message}\n`);
+  process.exitCode = 1;
+};
+
+const info = (message: string): void => {
+  process.stdout.write(`${message}\n`);
+};
+
+const warning = (message: string): void => {
+  process.stdout.write(`::warning::${message}\n`);
+};
+
+const parseBoolean = (raw: string, name: string): boolean => {
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new ActionError(`Input '${name}' must be 'true' or 'false'.`);
+};
+
+const parseInteger = (raw: string, name: string): number => {
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new ActionError(`Input '${name}' must be a non-negative integer.`);
+  }
+  return value;
+};
+
+const stripJsonComments = (text: string): string => {
+  let result = "";
+  let inString = false;
+  let quote = "";
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    const n = text[i + 1];
+
+    if (inLineComment) {
+      if (c === "\n") {
+        inLineComment = false;
+        result += c;
+      }
+      continue;
+    }
+
+    if (inBlockComment) {
+      if (c === "*" && n === "/") {
+        inBlockComment = false;
+        i += 1;
+      }
+      continue;
+    }
+
+    if (inString) {
+      result += c;
+      if (c === "\\") {
+        result += n;
+        i += 1;
+        continue;
+      }
+      if (c === quote) {
+        inString = false;
+        quote = "";
+      }
+      continue;
+    }
+
+    if (c === '"' || c === "'") {
+      inString = true;
+      quote = c;
+      result += c;
+      continue;
+    }
+
+    if (c === "/" && n === "/") {
+      inLineComment = true;
+      i += 1;
+      continue;
+    }
+
+    if (c === "/" && n === "*") {
+      inBlockComment = true;
+      i += 1;
+      continue;
+    }
+
+    result += c;
+  }
+
+  return result;
+};
+
+const parseDesiredState = (text: string): Map<string, string> => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripJsonComments(text).replace(/,\s*([}\]])/g, "$1"));
+  } catch {
+    throw new ActionError("Failed to parse JSONC file.");
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ActionError("Top-level JSONC value must be an object.");
+  }
+
+  const map = new Map<string, string>();
+  const put = (key: string, value: string): void => {
+    if (typeof key !== "string" || key.length === 0) throw new ActionError("Invalid key found.");
+    if (typeof value !== "string") throw new ActionError(`Value for key '${key}' must be a string.`);
+    if (map.has(key)) throw new ActionError(`Duplicate key found in source file: ${key}`);
+    map.set(key, value);
+  };
+
+  if ("data" in parsed) {
+    const data = (parsed as { data: unknown }).data;
+    if (!Array.isArray(data)) throw new ActionError("Canonical format requires 'data' array.");
+    for (const item of data) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        throw new ActionError("Each canonical item must be an object.");
+      }
+      const key = (item as { key: unknown }).key;
+      const value = (item as { value: unknown }).value;
+      put(String(key), value as string);
+    }
+    return map;
+  }
+
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof value !== "string") {
+      throw new ActionError(`Value for key '${key}' must be a string.`);
+    }
+    put(key, value);
+  }
+
+  return map;
+};
+
+const filterByPrefix = (map: Map<string, string>, prefix: string): Map<string, string> => {
+  if (!prefix) return map;
+  const filtered = new Map<string, string>();
+  for (const [k, v] of map.entries()) {
+    if (k.startsWith(prefix)) filtered.set(k, v);
+  }
+  return filtered;
+};
+
+const diffState = (
+  desiredRaw: Map<string, string>,
+  currentRaw: Map<string, string>,
+  deleteMissing: boolean,
+  prefix: string,
+): DiffResult => {
+  const desired = filterByPrefix(desiredRaw, prefix);
+  const current = filterByPrefix(currentRaw, prefix);
+
+  const puts: PutItem[] = [];
+  const deletes: DeleteItem[] = [];
+
+  for (const [k, v] of desired.entries()) {
+    if (current.get(k) !== v) puts.push({ key: k, value: v });
+  }
+
+  if (deleteMissing) {
+    for (const k of current.keys()) {
+      if (!desired.has(k)) deletes.push({ key: k });
+    }
+  }
+
+  return { puts, deletes, desiredCount: desired.size, currentCount: current.size };
+};
+
+const createUpdateBatches = (puts: PutItem[], deletes: DeleteItem[]): Array<{ puts: PutItem[]; deletes: DeleteItem[] }> => {
+  const batches: Array<{ puts: PutItem[]; deletes: DeleteItem[] }> = [];
+  let putIndex = 0;
+  let deleteIndex = 0;
+
+  while (putIndex < puts.length || deleteIndex < deletes.length) {
+    const batchPuts: PutItem[] = [];
+    const batchDeletes: DeleteItem[] = [];
+    let remaining = MAX_UPDATE_ITEMS_PER_REQUEST;
+
+    while (remaining > 0 && putIndex < puts.length) {
+      batchPuts.push(puts[putIndex]);
+      putIndex += 1;
+      remaining -= 1;
+    }
+
+    while (remaining > 0 && deleteIndex < deletes.length) {
+      batchDeletes.push(deletes[deleteIndex]);
+      deleteIndex += 1;
+      remaining -= 1;
+    }
+
+    batches.push({ puts: batchPuts, deletes: batchDeletes });
+  }
+
+  return batches;
+};
+
+const awsCliJson = async (operation: string, payload: Record<string, unknown>, region: string): Promise<Record<string, unknown>> => {
+  const args = ["cloudfront-keyvaluestore", operation, "--output", "json", "--cli-input-json", JSON.stringify(payload)];
+
+  if (region) {
+    args.push("--region", region);
+  }
+
+  try {
+    const { stdout } = await execFileAsync("aws", args, { maxBuffer: 1024 * 1024 * 20 });
+    return stdout ? JSON.parse(stdout) : {};
+  } catch (error) {
+    const stderr = typeof error === "object" && error !== null && "stderr" in error
+      ? String((error as { stderr?: unknown }).stderr ?? "")
+      : "";
+    throw new ActionError(`AWS CLI ${operation} failed. ${stderr}`.trim());
+  }
+};
+
+const listAllKeys = async (kvsArn: string, region: string): Promise<Map<string, string>> => {
+  const result = new Map<string, string>();
+  let nextToken: string | undefined;
+
+  do {
+    const response = await awsCliJson("list-keys", { KvsARN: kvsArn, NextToken: nextToken }, region);
+    for (const item of (response.Items as Array<{ Key?: string; Value?: unknown }> | undefined) ?? []) {
+      if (item.Key && typeof item.Value === "string") result.set(item.Key, item.Value);
+    }
+    nextToken = response.NextToken as string | undefined;
+  } while (nextToken);
+
+  return result;
+};
+
+const applySingleBatchWithRetry = async (
+  kvsArn: string,
+  puts: PutItem[],
+  deletes: DeleteItem[],
+  region: string,
+  retries = 3,
+): Promise<void> => {
+  for (let i = 1; i <= retries; i += 1) {
+    try {
+      const describe = await awsCliJson("describe-key-value-store", { KvsARN: kvsArn }, region);
+      const etag = describe.ETag;
+      if (!etag || typeof etag !== "string") {
+        throw new ActionError("describe-key-value-store response did not include ETag.");
+      }
+
+      await awsCliJson(
+        "update-keys",
+        {
+          KvsARN: kvsArn,
+          IfMatch: etag,
+          Puts: puts.map((x) => ({ Key: x.key, Value: x.value })),
+          Deletes: deletes.map((x) => ({ Key: x.key })),
+        },
+        region,
+      );
+
+      return;
+    } catch (error) {
+      if (i === retries) throw error;
+      info(`Retrying update after concurrent modification (attempt ${i + 1}/${retries})`);
+    }
+  }
+};
+
+const updateKeysWithRetry = async (
+  kvsArn: string,
+  puts: PutItem[],
+  deletes: DeleteItem[],
+  region: string,
+  retries = 3,
+): Promise<void> => {
+  if (puts.length === 0 && deletes.length === 0) return;
+
+  const batches = createUpdateBatches(puts, deletes);
+  for (const batch of batches) {
+    await applySingleBatchWithRetry(kvsArn, batch.puts, batch.deletes, region, retries);
+  }
+};
+
+const maskValue = (value: string): string => {
+  if (value.length <= 4) return "****";
+  return `${value.slice(0, 2)}***${value.slice(-2)}`;
+};
 
 const run = async (): Promise<void> => {
   try {
-    const inputs = readInputs();
-    const log = createLogger(inputs.logLevel);
+    const kvsArn = getInput("kvs-arn", true);
+    const file = getInput("file", true);
+    const dryRun = parseBoolean(getInput("dry-run", false, "false"), "dry-run");
+    const deleteMissing = parseBoolean(getInput("delete-missing", false, "true"), "delete-missing");
+    const failOnEmpty = parseBoolean(getInput("fail-on-empty", false, "true"), "fail-on-empty");
+    const maxPreviewItems = parseInteger(getInput("max-preview-items", false, "50"), "max-preview-items");
+    const prefix = getInput("prefix", false, "");
+    const awsRegion = getInput("aws-region", false, "us-east-1");
 
-    log.info(`Input file: ${inputs.file}`);
-    log.info(`Target KVS ARN: ${inputs.kvsArn}`);
-    log.info(`Dry run: ${inputs.dryRun}`);
+    info(`Input file: ${file}`);
+    info(`Target KVS ARN: ${kvsArn}`);
+    info(`Dry run: ${dryRun}`);
 
-    const desired = await loadDesiredStateFromFile(inputs.file);
-    const managedDesired = filterByPrefix(desired, inputs.prefix);
+    const content = await readFile(file, "utf8");
+    const desired = parseDesiredState(content);
 
-    if (managedDesired.size === 0 && inputs.failOnEmpty) {
-      throw new ConfigurationError("Parsed desired dataset is empty while fail-on-empty=true.");
+    if (filterByPrefix(desired, prefix).size === 0 && failOnEmpty) {
+      throw new ActionError("Parsed desired dataset is empty while fail-on-empty=true.");
     }
 
-    const kvsService = new KvsService();
-    const current = await kvsService.listAllKeys(inputs.kvsArn);
+    const current = await listAllKeys(kvsArn, awsRegion);
+    const diff = diffState(desired, current, deleteMissing, prefix);
 
-    const diff = computeDiff(desired, current, {
-      deleteMissing: inputs.deleteMissing,
-      prefix: inputs.prefix,
-    });
+    info(`Desired key count: ${diff.desiredCount}`);
+    info(`Current key count: ${diff.currentCount}`);
+    info(`Put count: ${diff.puts.length}`);
+    info(`Delete count: ${diff.deletes.length}`);
 
-    log.info(`Desired key count: ${managedDesired.size}`);
-    log.info(`Current key count: ${filterByPrefix(current, inputs.prefix).size}`);
-    log.info(`Put count: ${diff.puts.length}`);
-    log.info(`Delete count: ${diff.deletes.length}`);
-
-    const previewPuts = diff.puts.slice(0, inputs.maxPreviewItems);
-    const previewDeletes = diff.deletes.slice(0, inputs.maxPreviewItems);
-
-    if (previewPuts.length > 0) {
-      log.info("Put preview:");
-      for (const item of previewPuts) {
-        log.info(`  ${item.key} = ${maskValue(item.value)}`);
-      }
+    for (const item of diff.puts.slice(0, maxPreviewItems)) {
+      info(`PUT ${item.key}=${maskValue(item.value)}`);
+    }
+    for (const item of diff.deletes.slice(0, maxPreviewItems)) {
+      info(`DEL ${item.key}`);
     }
 
-    if (previewDeletes.length > 0) {
-      log.info("Delete preview:");
-      for (const item of previewDeletes) {
-        log.info(`  ${item.key}`);
-      }
-    }
-
-    if (inputs.dryRun) {
-      log.info("Dry-run mode enabled. No KVS write API calls were made.");
+    if (dryRun) {
+      info("Dry-run mode enabled. No write API calls were made.");
       return;
     }
 
-    if (diff.puts.length === 0 && diff.deletes.length === 0) {
-      log.info("No changes needed. KVS already matches desired state.");
-      return;
+    if (diff.deletes.length > 0 && diff.deletes.length === diff.currentCount) {
+      warning("All managed keys are scheduled for deletion.");
     }
 
-    if (diff.deletes.length > 0 && diff.deletes.length === filterByPrefix(current, inputs.prefix).size) {
-      log.warning("All managed keys are scheduled for deletion.");
-    }
-
-    if (diff.deletes.length >= 100) {
-      log.warning(`Large delete set detected: ${diff.deletes.length} keys.`);
-    }
-
-    await kvsService.applyDiff(inputs.kvsArn, diff.puts, diff.deletes);
-    log.info("Synchronization completed successfully.");
+    await updateKeysWithRetry(kvsArn, diff.puts, diff.deletes, awsRegion, 3);
+    info("Synchronization completed successfully.");
   } catch (error) {
-    if (error instanceof ConfigurationError || error instanceof ParseValidationError) {
-      core.setFailed(error.message);
-      return;
-    }
-
-    if (error instanceof Error) {
-      core.setFailed(error.message);
-      return;
-    }
-
-    core.setFailed("Unexpected internal error.");
+    setFailed(error instanceof Error ? error.message : "Unexpected internal error.");
   }
 };
 
